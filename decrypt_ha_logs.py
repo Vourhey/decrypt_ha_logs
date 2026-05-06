@@ -1,9 +1,13 @@
+import argparse
 import json
 import logging
-import os
+import re
+import shutil
 import sys
 import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from zipfile import ZipFile
 
 import ipfs_api
@@ -17,15 +21,116 @@ from substrateinterface import Keypair, KeypairType
 from urllib3.util import Retry
 
 LOGGER = logging.getLogger(__name__)
-LOGGER.setLevel(logging.INFO)
 
 CREDS_FILE = "creds.yaml"
-ARCHIVE_FILES_DIR = "encrypted_logs"
-NETWORK_WSS = "wss://polkadot.rpc.robonomics.network/"
-PINATA_GATEWAY = "https://ipfs.io"
 
 
-def ipfs_download(cid: str, file_path: str, gateway: str) -> None:
+@dataclass(frozen=True)
+class SenderConfig:
+    address: str
+    name: str
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    recipient_seed: str
+    sender_addresses: list[SenderConfig]
+    reports_dir: Path
+    reports_per_address: int
+    ipfs_gateway: str
+    network_wss: str
+    clean_reports: bool
+
+
+def setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download and decrypt recent Home Assistant reports from Robonomics datalog."
+    )
+    parser.add_argument("--creds", default=CREDS_FILE, help="Path to creds YAML file.")
+    return parser.parse_args()
+
+
+def require_config_value(creds: dict, key: str):
+    value = creds.get(key)
+    if value is None:
+        raise ValueError(f"{key} is required.")
+    return value
+
+
+def require_config_str(creds: dict, key: str) -> str:
+    value = str(require_config_value(creds, key)).strip()
+    if not value:
+        raise ValueError(f"{key} cannot be empty.")
+    return value
+
+
+def require_config_int(creds: dict, key: str) -> int:
+    value = require_config_value(creds, key)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{key} must be an integer.") from e
+
+
+def require_config_bool(creds: dict, key: str) -> bool:
+    value = require_config_value(creds, key)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false.")
+    return value
+
+
+def normalize_sender_addresses(creds: dict) -> list[SenderConfig]:
+    senders = creds.get("sender_addresses")
+    if senders is None:
+        raise ValueError("sender_addresses is required.")
+
+    result: list[SenderConfig] = []
+    for item in senders:
+        if isinstance(item, str):
+            address = item.strip()
+            name = address
+        elif isinstance(item, dict):
+            address = str(item.get("address") or "").strip()
+            name = str(item.get("name") or address).strip()
+        else:
+            raise ValueError("Each sender address must be a string or a mapping.")
+
+        if not address:
+            raise ValueError("Sender address cannot be empty.")
+        result.append(SenderConfig(address=address, name=name or address))
+
+    if not result:
+        raise ValueError("No sender addresses configured.")
+    return result
+
+
+def load_config(args: argparse.Namespace) -> AppConfig:
+    creds_path = Path(args.creds)
+    with open(creds_path, "r", encoding="utf-8") as f:
+        creds: dict = yaml.load(f, Loader=yaml.SafeLoader) or {}
+
+    recipient_seed = require_config_str(creds, "recipient_seed")
+
+    reports_per_address = require_config_int(creds, "reports_per_address")
+    if reports_per_address < 1:
+        raise ValueError("reports_per_address must be greater than 0.")
+
+    return AppConfig(
+        recipient_seed=recipient_seed,
+        sender_addresses=normalize_sender_addresses(creds),
+        reports_dir=Path(require_config_str(creds, "reports_dir")),
+        reports_per_address=reports_per_address,
+        ipfs_gateway=require_config_str(creds, "ipfs_gateway"),
+        network_wss=require_config_str(creds, "network_wss"),
+        clean_reports=require_config_bool(creds, "clean_reports"),
+    )
+
+
+def ipfs_download(cid: str, file_path: Path, gateway: str) -> None:
     """
     Function for download files from IPFS
     :param cid: File CID
@@ -34,53 +139,89 @@ def ipfs_download(cid: str, file_path: str, gateway: str) -> None:
     :return: None
     """
     if gateway:
-        url: str = urllib.parse.urljoin(gateway, "ipfs/" + cid)
+        url: str = urllib.parse.urljoin(gateway.rstrip("/") + "/", "ipfs/" + cid)
         retry_num: int = 5
         try:
-            # Define the retry strategy
             retry_strategy = Retry(
                 total=retry_num,
                 backoff_factor=3,
                 status_forcelist=[429, 500, 502, 503, 504],
             )
 
-            # Create an HTTP adapter with the retry strategy and mount it to session
             adapter = HTTPAdapter(max_retries=retry_strategy)
-
-            # Create a new session object
             session = requests.Session()
             session.mount("http://", adapter)
             session.mount("https://", adapter)
 
-            response = session.get(url, allow_redirects=True)
+            response = session.get(url, allow_redirects=True, timeout=60)
+            response.raise_for_status()
 
-            open(file_path, "wb").write(response.content)
-
+            with open(file_path, "wb") as f:
+                f.write(response.content)
             return
 
         except Exception as e:
-            print("Error %s", e)
-    ipfs_api.download(cid, file_path)
-    return
+            LOGGER.warning("IPFS gateway download failed: %s", e)
+
+    ipfs_api.download(cid, str(file_path))
 
 
 def parse_decrypted(text: str) -> tuple[str, dict | None]:
     """
-    Parse decrypted data if metadata was added or return just data overwise
+    Parse decrypted data if metadata was added or return just data otherwise.
     """
     try:
         obj = json.loads(text)
         if isinstance(obj, dict) and "payload" in obj:
-            return obj["payload"], obj.get("meta")
+            meta = obj.get("meta")
+            return obj["payload"], meta if isinstance(meta, dict) else None
     except json.JSONDecodeError:
         pass
     return text, None
 
 
-def clean_archive_dir(path: str) -> None:
-    for entry in os.scandir(path):
-        if entry.is_file():
-            os.remove(entry.path)
+def clean_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for entry in path.iterdir():
+        if entry.is_dir():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+
+
+def clean_reports_dir(path: Path) -> None:
+    resolved = path.resolve()
+    unsafe_paths = {Path.cwd().resolve(), Path.home().resolve(), Path("/").resolve()}
+    if resolved in unsafe_paths:
+        raise ValueError(f"Refusing to clean unsafe reports directory: {resolved}")
+    clean_dir(path)
+
+
+def safe_path_part(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return value.strip("._-") or "unknown"
+
+
+def safe_output_path(base_dir: Path, file_name: str) -> Path:
+    if not file_name:
+        file_name = "decrypted_report.txt"
+
+    candidate = (base_dir / file_name).resolve()
+    base_resolved = base_dir.resolve()
+    if not candidate.is_relative_to(base_resolved):
+        candidate = base_resolved / Path(file_name).name
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
+    target_resolved = target_dir.resolve()
+    with ZipFile(zip_path, "r") as zip_file:
+        for member in zip_file.infolist():
+            member_path = (target_resolved / member.filename).resolve()
+            if not member_path.is_relative_to(target_resolved):
+                raise ValueError(f"Unsafe path in archive: {member.filename}")
+        zip_file.extractall(target_resolved)
 
 
 def decrypt_msg(
@@ -89,11 +230,11 @@ def decrypt_msg(
     recipient_keypair: Keypair,
 ) -> bytes:
     """
-    Decrypt message with recepient private key and sender puplic key
+    Decrypt message with recipient private key and sender public key.
 
     :param encrypted_msg:       Message to decrypt
     :param sender_public_key:   Sender public key
-    :param recipient_keypair:   Recepient account keypair
+    :param recipient_keypair:   Recipient account keypair
 
     :return: Decrypted message
     """
@@ -117,7 +258,6 @@ def multi_envelope_decrypt_data(
     :return: data after decryption
     """
 
-    # Check if JSON encryption package is valid
     try:
         package_json = json.loads(encryption_package)
     except json.JSONDecodeError as e:
@@ -127,11 +267,10 @@ def multi_envelope_decrypt_data(
     try:
         encrypted_secret_keys = package_json["keys"]
         encrypted_data_hex = package_json["data"]
-    except (TypeError, ValueError) as e:
+    except (KeyError, TypeError, ValueError) as e:
         LOGGER.warning("Envelope decrypt: missing required fields in package")
         raise ValueError("Invalid encryption package structure") from e
 
-    # Check if recipient address is authorized with secret key
     recipient_address = recipient_account.get_address()
     encrypted_secret_key = encrypted_secret_keys.get(recipient_address)
     if not encrypted_secret_key:
@@ -139,8 +278,6 @@ def multi_envelope_decrypt_data(
             "Envelope decrypt: recipient key not found for %s", recipient_address
         )
         raise ValueError("Recipient is not authorized for this package")
-
-    # Get secret key from public-key decryption
 
     try:
         sender_kp = Keypair(
@@ -155,11 +292,10 @@ def multi_envelope_decrypt_data(
         raise ValueError("Failed to decrypt secret key") from e
 
     try:
-        # Deserialize encrypted data: remove 0x from beginning,
-        # transform to bytes
-        encrypted_data = bytes.fromhex(encrypted_data_hex[2:])
+        if encrypted_data_hex[:2] == "0x":
+            encrypted_data_hex = encrypted_data_hex[2:]
+        encrypted_data = bytes.fromhex(encrypted_data_hex)
 
-        # Decrypt actual message (in form of bytes) and decode it
         decrypted_data_bytes = SecretBox(secret_key).decrypt(encrypted_data)
         decrypted_data = decrypted_data_bytes.decode("utf-8")
 
@@ -169,59 +305,178 @@ def multi_envelope_decrypt_data(
         raise ValueError("Failed to decrypt payload") from e
 
 
-creds_path = Path(CREDS_FILE)
-with open(creds_path, "r") as f:
-    creds_dict: dict = yaml.load(f, Loader=yaml.SafeLoader)
+def get_datalog_item(
+    datalog: Datalog, sender_address: str, index: int
+) -> tuple[int, str] | None:
+    record = datalog._service_functions.chainstate_query(
+        "Datalog", "DatalogItem", [sender_address, index]
+    )
+    if not record or record[0] == 0:
+        return None
+    return record
 
-recipient_seed: str = creds_dict.get("recipient_seed")
-recipient_account = Account(
-    recipient_seed, crypto_type=KeypairType.ED25519, remote_ws=NETWORK_WSS
-)
-sender_address: str = creds_dict.get("sender_address")
+
+def get_recent_datalogs(
+    datalog: Datalog, sender_address: str, count: int
+) -> list[tuple[int, int, str]]:
+    index_info = datalog.get_index(sender_address)
+    start = int(index_info["start"])
+    end = int(index_info["end"])
+    if end <= start:
+        return []
+
+    indices = range(max(start, end - count), end)
+    result: list[tuple[int, int, str]] = []
+    for index in indices:
+        record = get_datalog_item(datalog, sender_address, index)
+        if record is None:
+            LOGGER.warning("Datalog #%s is empty for %s", index, sender_address)
+            continue
+        timestamp, datalog_content = record
+        result.append((index, timestamp, str(datalog_content)))
+    return result
 
 
-datalog = Datalog(recipient_account, rws_sub_owner=recipient_account.get_address())
+def decrypt_archive_files(
+    archive_files_path: Path,
+    output_dir: Path,
+    recipient_account: Account,
+    sender_address: str,
+) -> int:
+    decrypted_count = 0
+    for entry in sorted(archive_files_path.rglob("*")):
+        if not entry.is_file():
+            continue
 
-[timestamp, datalog_content] = datalog.get_item(addr=sender_address, index=16)
+        with open(entry, "r", encoding="utf-8") as f:
+            data = f.read()
 
-archive_name = str(datalog_content)
+        try:
+            decrypted_data = multi_envelope_decrypt_data(
+                data, recipient_account, sender_address
+            )
 
-cid = archive_name
-archive_path = os.path.join(os.path.curdir, archive_name)
-archive_files_path = os.path.join(os.path.curdir, ARCHIVE_FILES_DIR)
-clean_archive_dir(archive_files_path)
+            decrypted_payload, decrypted_meta = parse_decrypted(decrypted_data)
+            file_name = (
+                decrypted_meta.get("orig_file_name")
+                if decrypted_meta
+                else entry.with_suffix(".txt").name
+            )
 
-print(cid)
+            file_path = safe_output_path(output_dir, file_name)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(decrypted_payload)
+            decrypted_count += 1
+            LOGGER.info("File %s is successfully decrypted", file_path)
+        except Exception as e:
+            LOGGER.warning("Problem during decrypting %s: %s", entry.name, e)
+    return decrypted_count
 
-try:
-    ipfs_download(cid, archive_path, PINATA_GATEWAY)
-except ConnectionError:
-    LOGGER.error("Please, run IPFS daemon or check your Internet connection")
-    sys.exit()
 
-with ZipFile(archive_path, "r") as zip_file:
-    zip_file.extractall(archive_files_path)
-
-for entry in os.scandir(archive_files_path):
-    with open(entry.path, "r", encoding="utf-8") as f:
-        data = f.read()
+def process_datalog_report(
+    cid: str,
+    sender_address: str,
+    output_dir: Path,
+    recipient_account: Account,
+    ipfs_gateway: str,
+) -> int:
+    archive_path = output_dir / f"{safe_path_part(cid)}.zip"
 
     try:
-        decrypted_data = multi_envelope_decrypt_data(
-            data, recipient_account, sender_address
+        LOGGER.info("Downloading IPFS archive %s", cid)
+        ipfs_download(cid, archive_path, ipfs_gateway)
+
+        with TemporaryDirectory(prefix="encrypted_logs_", dir=output_dir) as tmp_dir:
+            archive_files_path = Path(tmp_dir)
+            safe_extract_zip(archive_path, archive_files_path)
+
+            return decrypt_archive_files(
+                archive_files_path, output_dir, recipient_account, sender_address
+            )
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+
+def process_sender(
+    sender: SenderConfig,
+    datalog: Datalog,
+    recipient_account: Account,
+    config: AppConfig,
+) -> None:
+    sender_dir = config.reports_dir / safe_path_part(sender.name)
+    sender_dir.mkdir(parents=True, exist_ok=True)
+
+    LOGGER.info("Processing sender %s", sender.address)
+    records = get_recent_datalogs(
+        datalog, sender.address, config.reports_per_address
+    )
+    if not records:
+        LOGGER.warning("No datalog records found for %s", sender.address)
+        return
+
+    for index, timestamp, cid in records:
+        report_dir = sender_dir / f"datalog_{index}_{timestamp}"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        cid_file = report_dir / "cid.txt"
+        with open(cid_file, "w", encoding="utf-8") as f:
+            f.write(cid + "\n")
+
+        try:
+            decrypted_count = process_datalog_report(
+                cid,
+                sender.address,
+                report_dir,
+                recipient_account,
+                config.ipfs_gateway,
+            )
+            LOGGER.info(
+                "Datalog #%s from %s: decrypted %s file(s)",
+                index,
+                sender.address,
+                decrypted_count,
+            )
+        except (ConnectionError, OSError, ValueError) as e:
+            LOGGER.warning(
+                "Problem during processing datalog #%s from %s: %s",
+                index,
+                sender.address,
+                e,
+            )
+
+
+def main() -> int:
+    setup_logging()
+    try:
+        config = load_config(parse_args())
+
+        if config.clean_reports:
+            clean_reports_dir(config.reports_dir)
+        else:
+            config.reports_dir.mkdir(parents=True, exist_ok=True)
+
+        recipient_account = Account(
+            config.recipient_seed,
+            crypto_type=KeypairType.ED25519,
+            remote_ws=config.network_wss,
+        )
+        datalog = Datalog(
+            recipient_account, rws_sub_owner=recipient_account.get_address()
         )
 
-        decrypted_payload, decrypted_meta = parse_decrypted(decrypted_data)
+        for sender in config.sender_addresses:
+            try:
+                process_sender(sender, datalog, recipient_account, config)
+            except Exception as e:
+                LOGGER.warning(
+                    "Problem during processing sender %s: %s", sender.address, e
+                )
 
-        file_name = decrypted_meta.get("orig_file_name")
-
-        file_path = os.path.join(os.path.curdir, file_name)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(decrypted_payload)
-            LOGGER.info("File %s is successfully decrypted", file_path)
+        LOGGER.info("All done")
+        return 0
     except Exception as e:
-        LOGGER.warning("Problem during decrypting files: %s", e)
+        LOGGER.error("%s", e)
+        return 1
 
-os.remove(archive_path)
-clean_archive_dir(archive_files_path)
-LOGGER.info("All done")
+
+if __name__ == "__main__":
+    sys.exit(main())

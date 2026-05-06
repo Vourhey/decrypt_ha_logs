@@ -1,2 +1,11 @@
-recipient_seed:             ''
-sender_address:             ''
+recipient_seed: ''
+
+sender_addresses:
+  - address: ''
+    name: ''
+
+reports_per_address: 2
+reports_dir: reports
+clean_reports: true
+ipfs_gateway: https://ipfs.io
+network_wss: wss://polkadot.rpc.robonomics.network/
