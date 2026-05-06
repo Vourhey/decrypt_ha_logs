@@ -1,0 +1,8 @@
+creds.yaml
+decrypt_ha_logs.zip
+home-assistant.log
+issue_description.json
+trace.saved_traces
+.idea/
+.venv/
+encrypted_logs/
